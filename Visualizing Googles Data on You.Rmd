@@ -1,0 +1,376 @@
+---
+title: "Visualizing Google's Data on You"
+author: "Richard Sciotti"
+date: "May 10, 2018"
+output:
+  html_document:
+    toc: true
+---
+
+```{r knitr, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+It is a safe bet to assume that at some point or another you have used a Google product. I figured Google must have a pretty good amassment of data on me by this point. I took a look at my collection of data using [Google Takeout](https://takeout.google.com/settings/takeout). If you plan to follow along may want to go ahead and start downloading it now because it may take Google anywhere from a few hours to a few days to prepare it for you.
+
+Outside of this being interesting (which alone was enough to motivate me to analyze this) this is useful because, without a doubt, Google (as well as anyone who Google may share the data with) is analyzing your data for advertisement and features like auto complete.
+
+*Note: If you have questions at any point there is a resources section at the end of the document*
+
+### Packages
+
+Let's begin by loading the packages that we will be using.
+
+```{r setup, message=FALSE, warning=FALSE}
+
+library(tidyverse) # Data manipulation
+library(plyr) # Data manipulation
+library(rvest) # Html scraping
+library(lubridate) # Date and time manipulation
+library(qdap) # Text mining
+library(tm) # Text mining
+
+``` 
+
+# Google Search Analysis
+
+It's impossible to think of Google without thinking of Google search. Google happens to provide a list of **every** search you have ever made using their search engine (while logged in). 
+
+### Setup
+
+First we need to parse the provided HTML file into something a bit more usable for analysis. This bit of code reads in html and outputs a string array of the text we are looking for without any html tags.
+  
+*Note: If you extracted the Takeout folder into your R workspace you can leave this directory as is otherwise provide the path to the 'MyActivity.html'*
+
+```{r parse_html}
+raw_html <- read_html("./Takeout/My Activity/Search/MyActivity.html") # Read in html
+raw_html <- raw_html %>%
+  html_nodes(".mdl-typography--body-1") %>% # Use CSS selector to narrow down results
+  html_text(trim = TRUE) %>% # Extract text from html
+  #Regex below captures 4 groups: (Searched/Visited term)(Search content)(Date of search)(AM or PM)
+  str_match("^(Visited|Searched for)(.+)(\\w{3} \\d+, \\d{4}, \\d{1,2}:\\d{2}:\\d{2} (?:AM|PM))$")
+raw_html[,2:4] %>% head(1)
+```
+
+Next we want to reformat the string array to something a bit more tidy.
+
+```{r reformat_html}
+search_df <- raw_html %>%
+  as_data_frame() %>% # Convert array of strings to data frame
+  na.omit() # Remove empty rows
+search_df$V1 <- NULL # Remove the original string
+names(search_df) <- c("action", "content", "date_time") # Retitle V2,V3,V4
+# Line below converts date column from string to a date time
+search_df$date_time <- as.POSIXct(search_df$date_time,format="%b %d, %Y, %I:%M:%S %p")
+search_df %>% head()
+
+```
+
+### Searches by week
+
+Let's start off with something simple like plotting number of searches by week. I am going to color this by whether the entry is searched vs visited in case the way one of them is recorded isn't distributed equally.
+
+```{r fig.width=7, fig.height=4, searched_over_time}
+search_df %>%
+  group_by(week=floor_date(date_time, "week"), action) %>% # View data weekly
+  filter(year(date_time) >= 2016) %>%
+  ggplot(mapping=aes(x=week, fill = forcats::fct_rev(action), stat="count")) + # Plot based search frequency
+    scale_x_datetime(date_breaks = "2 month", date_labels = "%b %Y") + # Reformat x axis labels
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + # Rotate x axis labels
+    guides(fill=guide_legend(title="action")) + # Retitle legend
+    geom_bar()
+```
+
+You can notice that there is a massive drop around February 2018 where I decided to give DuckDuckGo a try. Next I am going to check if there is an obvious pattern in search frequency by day, week or month. This can be accomplished using a heat map calendar plot.
+
+```{r seasonal_patterns}
+heatmap_data <- search_df %>%
+  filter(year(date_time) >= 2016, action=="Searched for") %>%
+  group_by(date=floor_date(date_time, "day")) %>% # View data daily
+  ddply(.(date), summarise, freq = length(content)) # Count searches by day
+
+heatmap_data <- heatmap_data %>% transform(
+  week = as.POSIXlt(date)$yday %/% 7 + 1,
+  wday = as.POSIXlt(date)$wday,
+  year = as.POSIXlt(date)$year + 1900)
+
+days_of_week <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+# Plot data as calendar plot
+ggplot(heatmap_data, aes(week, wday, fill = freq)) + 
+  geom_tile(colour = "white") + 
+  facet_wrap(~ year, ncol = 1) +
+  scale_fill_gradient(low="red", high="yellow") +
+  xlab(NULL) +
+  ylab(NULL) + 
+  scale_y_reverse(labels = days_of_week, breaks = seq(0,6))
+  
+
+```
+
+Nothing striking appears to be here although this may differ for your data.
+
+### Searches by time of day
+  
+Next plot that would be interesting is search frequency by time of day. Violin plots function similarly to box plots but also show density. This would reveal if there are any hours where I am particularly curious (although most likely will just reveal the hours at which I am awake).
+
+```{r search_time_of_day}
+search_df %>%
+  group_by(month=format(date_time, "%m")) %>% # Group into months
+  filter(year(date_time) >= 2016) %>%
+  ggplot(mapping=aes(x=month, y=(hour(date_time) + minute(date_time) / 60))) + # Plot search frequency
+    ylab("hour") +
+    geom_violin()
+```
+
+This plot pretty nicely sums up when I make most of my searches (doing work) as well as when I go to sleep. I normally wake up earlier in summer months for a job compared to the rest of the year. I am a bit surprised by how late I seem to stay up! This could be due to including the weekends into the same category as week days. Let's split this into individual days and also separate this into summer and school year because my schedule is much different over the summer. Split violin plots are a good visual way of comparing the distribution and density of two samples.
+   
+*Note: I am using a split violin plot here. This is not included in ggplot2 or R by default but the code for which can be [found here](https://stackoverflow.com/questions/35717353/split-violin-plot-with-ggplot2 "Stack Overflow - Split violin plot with ggplot2")*
+   
+```{r split_violin, include=FALSE}
+
+GeomSplitViolin <- ggproto("GeomSplitViolin", GeomViolin, draw_group = function(self, data, ..., draw_quantiles = NULL){
+  data <- transform(data, xminv = x - violinwidth * (x - xmin), xmaxv = x + violinwidth * (xmax - x))
+  grp <- data[1,'group']
+  newdata <- plyr::arrange(transform(data, x = if(grp%%2==1) xminv else xmaxv), if(grp%%2==1) y else -y)
+  newdata <- rbind(newdata[1, ], newdata, newdata[nrow(newdata), ], newdata[1, ])
+  newdata[c(1,nrow(newdata)-1,nrow(newdata)), 'x'] <- round(newdata[1, 'x']) 
+  if (length(draw_quantiles) > 0 & !scales::zero_range(range(data$y))) {
+    stopifnot(all(draw_quantiles >= 0), all(draw_quantiles <= 
+                                              1))
+    quantiles <- ggplot2:::create_quantile_segment_frame(data, draw_quantiles)
+    aesthetics <- data[rep(1, nrow(quantiles)), setdiff(names(data), c("x", "y")), drop = FALSE]
+    aesthetics$alpha <- rep(1, nrow(quantiles))
+    both <- cbind(quantiles, aesthetics)
+    quantile_grob <- GeomPath$draw_panel(both, ...)
+    ggplot2:::ggname("geom_split_violin", grid::grobTree(GeomPolygon$draw_panel(newdata, ...), quantile_grob))
+  }
+  else {
+    ggplot2:::ggname("geom_split_violin", GeomPolygon$draw_panel(newdata, ...))
+  }
+})
+
+geom_split_violin <- function (mapping = NULL, data = NULL, stat = "ydensity", position = "identity", ..., draw_quantiles = NULL, trim = TRUE, scale = "area", na.rm = FALSE, show.legend = NA, inherit.aes = TRUE) {
+  layer(data = data, mapping = mapping, stat = stat, geom = GeomSplitViolin, position = position, show.legend = show.legend, inherit.aes = inherit.aes, params = list(trim = trim, scale = scale, draw_quantiles = draw_quantiles, na.rm = na.rm, ...))
+}
+
+```
+
+```{r search_weekly}
+
+search_df %>%
+  filter(year(date_time) >= 2016) %>%
+  mutate(summer = (week(date_time) > 20 & week(date_time) < 35)) %>%
+  group_by(day=format(date_time, "%u")) %>% # Group into months
+  ggplot(mapping=aes(x=day, y=(hour(date_time) + minute(date_time) / 60), fill=summer)) +
+    ylab("hour") +
+    scale_x_discrete(labels = days_of_week) +
+    geom_split_violin()
+
+```
+
+This plot makes it much easier to see that I go to sleep and wake up a bit earlier during the summer (with the exception of the weekend). During the rest of the year I cease making searches around the same time regardless of weekday vs weekend.
+
+### Search Content
+
+Search content is probably more interesting to most people then search timing or frequency. We are going to use mainly the qdap and tm package to analyze the search content in the Takeout file.
+   
+The first thing to do is clean the data up a bit more. I am only going to look at data from later than 2016. Second, I am removing any non-ASCII characters to make this process easier.
+
+```{r search_content_setup}
+search_df$clean_content <- iconv(search_df$content, "latin1", "ASCII", sub="")
+```
+
+Checking out all-time (if you consider time to start from 2016 in this example) most frequent non-'stop words' is probably going to be the first thing anyone would want to do with the data available to them. Stop words are words like 'how', 'is' or 'the'. These are not very interesting to us and will undoubtedly show up in the most frequent terms if not removed.
+
+```{r search_content_most_freq}
+frequent_terms <- search_df %>%
+  filter(year(date_time) >= 2016, action == "Searched for") %>%
+  select(clean_content) %>%
+  freq_terms(10, stopwords=stopwords('en')) # Collect 1000 most frequent terms
+frequent_terms
+  
+  # Uncomment this code if you would prefer a pie chart instead of a list
+  #  frequent_terms %>%
+  #    ggplot(aes(x="", y=FREQ, fill=WORD)) +
+  #    geom_bar(width = 1, stat = "identity") +
+  #    geom_text(aes(label = FREQ), position = position_stack(vjust = 0.5)) +
+  #    coord_polar("y", start=0)
+```
+
+I seem to enjoy comparing things with 'vs' a lot but nothing too surprising here. Does my most frequent words change over time though?
+
+This was not trivial to plot and may not look great at first if you are using your own data. This plot represents the most frequent search by month for each month since jan 2016. If you are working with more than two years worth of data I suggest you limit it. Interests tend to change over time meaning a large set of unique values. This makes labeling almost required because colors can not accurately represent every value. Including more than two years may make your plot incredibly cluttered.
+
+The method to do plot this I found was to split the data frame apart by month, iterate through the months, find the most frequent weekly terms, recompile them and graph them.
+
+*I advise plotting the figure for the section larger with 'fig.width=20, fig.height=9' in the section header if using r studio*
+
+```{r fig.width=20, fig.height=9, search_content_over_time}
+# Split the data apart
+monthly_searches_df <- search_df %>%
+  filter(year(date_time) >= 2016, action == "Searched for") %>% # We only want searches past 2016
+  mutate(month=month(date_time) + 12 * (year(date_time) - 2016)) # Add months since 2016 column
+monthly_searches_df <- split(monthly_searches_df, f = monthly_searches_df$month) # Split data based on month
+
+# Prepare to iterate through month by month data frames
+output_df <- data.frame(matrix(ncol = 3, nrow = 0))
+names(output_df) <- c("month", "word", "count")
+index <- 1
+
+# Iterate month by month
+for(i in monthly_searches_df){
+  result <- freq_terms(i$clean_content, 6, extend=FALSE, stopwords=stopwords('en'))
+  result_size <- nrow(result)
+  temp_df <- data.frame(month=numeric(result_size), word=character(result_size), count=numeric(result_size))
+  temp_df$month <- rep(index) # Carry month over
+  temp_df$word <- result$WORD # Add most frequent words
+  temp_df$count <- result$FREQ # Add word frequency
+  output_df <- rbind(output_df, temp_df) # Recombine temporary structure with output
+  index <- index + 1
+}
+
+# Plot
+output_df %>%
+  ggplot(mapping=aes(x=factor(month), y=count, fill=word)) + 
+    geom_bar(position=position_stack(), stat = "identity") + 
+    geom_text(aes(label=word), color="white", size=3, position = position_stack(vjust=.5)) +
+    xlab("months since jan 2016") + 
+    guides(fill=FALSE)
+
+```
+
+This plot will probably look pretty interesting due to how much data is represented. You may be tempted to try and find patterns in the data manually. We can use k-means clustering to find groups in the data set for us. k-means clustering is a type of unsupervised machine learning. The algorithm attempts to label un-grouped data by minimizing distance from cluster centroids.
+
+### K Means Clustering
+
+Instead of only using a few words we are going to try and represent most or all of the search words. The setup will be mostly the same but in order to represent all of this data it will help to switch plot types as well as grouping data by week instead of month.
+
+```{r k_means_setup} 
+
+# Split the data apart
+weekly_searches_df <- search_df %>%
+  filter(year(date_time) >= 2016, action == "Searched for") %>%
+  mutate(week=week(date_time) + 4 * month(date_time) + 52 * (year(date_time) - 2016))
+weekly_searches_df <- split(weekly_searches_df, f = weekly_searches_df$week)
+
+# Prepare to iterate through week by week data frames
+output_df <- data.frame(matrix(data=NA, ncol = 3, nrow = 0))
+names(output_df) <- c("week", "word", "count")
+index <- 1
+
+# Iterate week by week
+for(i in weekly_searches_df){
+  result <- freq_terms(i$clean_content, 7, stopwords=stopwords('en'), at.least = 2)
+  result_size <- nrow(result)
+  temp_df <- data.frame(week=numeric(result_size), word=character(result_size), count=numeric(result_size))
+  temp_df$week <- rep(index)
+  temp_df$word <- result$WORD
+  temp_df$count <- result$FREQ
+  output_df <- rbind(output_df, temp_df)
+  index <- index + 1
+}
+
+# Plot
+output_df %>%
+  ggplot(mapping=aes(x=week, y=count)) + 
+    geom_jitter() + 
+    xlab("weeks since jan 2016") 
+```
+
+The next step is to cluster the data. 
+
+```{r k_means_clustering}
+set.seed(320)
+
+# Cluster
+searchCluster <- kmeans(output_df[,c("count")], 10, nstart = 50)
+searchCluster$cluster <- as.factor(searchCluster$cluster)
+
+# Plot
+output_df %>%
+  ggplot(mapping=aes(x=week, y=count, color=searchCluster$cluster)) + 
+    geom_jitter() + 
+    guides(color=guide_legend(title="cluster")) +
+    xlab("weeks since jan 2016")
+```
+
+Now I chose 10 clusters just out of a guess. 10 clusters may not be optimal, and it certainly won't be good for every data set. To find out the optimal amount of clusters I am going to use the 'elbow method' which entails plotting cluster count by within-cluster sum of squares. The key is to strike a balance between fitting the data well and over-fitting it.
+
+```{r elbow_method}
+k_max <- 15
+wss <- sapply(1:k_max, 
+              function(k){kmeans(output_df[,c("count")], k, nstart=50)$tot.withinss})
+qplot(seq_along(wss), wss, geom="line", log="y") +
+  xlab("number of clusters") +
+  ylab("log(wss)")
+```
+
+```{r revised_k_means}
+set.seed(320)
+
+# Cluster
+searchCluster <- kmeans(output_df[,c("count")], 6, nstart = 50)
+searchCluster$cluster <- as.factor(searchCluster$cluster)
+
+# Plot
+output_df %>%
+  ggplot(mapping=aes(x=week, y=count, color=searchCluster$cluster)) + 
+    geom_jitter() + 
+    guides(color=guide_legend(title="cluster")) +
+    xlab("weeks since jan 2016")
+```
+
+Finally, I can use these clusters to see if any patterns emerge. I'll sum up the number of times that each word is found inside of a cluster and sort by occurrences in descending order.
+
+```{r inside_group_analysis}
+output_df$cluster <- searchCluster$cluster
+
+#Print cluster content (in order)
+sapply(1:6, function(k){
+    output_df %>%
+    filter(cluster == k) %>%
+    ddply(.(word), summarise, freq = length(word)) %>%
+    arrange(desc(freq), desc(word)) %>%
+    head() %>%
+    knitr::kable()
+})
+
+```
+
+First observation is that the term 'umd' appears very frequently in the lower count clusters. Oddly it appears to be incredibly far ahead in cluster 5. Overall it appears very frequently but limited to the lower count clusters suggesting that it is something I consistently search but not something that I search many times during a specific interval.
+
+Also interesting is cluster #3 has the first term 'warframe' at 8 occurrences with the next highest term at a mere 2. The term 'warframe' also fails to appear in any of the other clusters (at least my peek at the top 6). It seems that is something that I am usually not interested in, but when I am, I generate a lot of searches under it.
+ 
+# Resources
+
+I highly recommend searching 'r <function>' for any questions on function parameters. 99% of the time this will direct you to the specific function page in the appropriate documentation. If I am going to be honest, searching any issue you come across is likely to net you an answer. Throughout this and other projects I have learned that for seemingly any issue there is a host of others who have ran into the exact same problem. However, if you are looking for specific websites, I have listed some that I found useful.
+
+General documentation
+  
+https://www.rdocumentation.org/
+  
+https://cran.r-project.org/manuals.html
+
+Plotting
+
+<span style="color:red">http://r-statistics.co/Top50-Ggplot2-Visualizations-MasterList-R-Code.html</span> I highly recommend checking this out! This was immensely useful for determining which plots to use. I can see myself using this as a resource for projects that may not even be in R. 
+  
+http://ggplot2.tidyverse.org/reference/
+
+Text mining
+  
+ftp://cran.r-project.org/pub/R/web/packages/qdap/qdap.pdf
+  
+https://cran.r-project.org/web/packages/tm/tm.pdf
+
+K-means clustering
+  
+https://www.r-bloggers.com/k-means-clustering-in-r/
+
+# Contact
+
+If you have any questions/comments/corrections/suggestions for me feel free to contact me at rvs20hw\@gmail.com
+
